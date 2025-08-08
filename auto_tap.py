@@ -144,9 +144,39 @@ class AutoTAP:
             self.gcode.respond_info(f"[AUTO_TAP] Failed reading probe z_offset ({e}); defaulting to 0.0")
         
         if self.samples is None:
-            self.samples = probe.sample_count
+            # Newer Klipper versions may rename or hide sample_count; attempt several candidates.
+            sample_attr_candidates = [
+                'sample_count',   # legacy
+                'samples',        # possible rename
+                'samples_count',  # alternative style
+                'sample_number'   # defensive
+            ]
+            for cand in sample_attr_candidates:
+                if hasattr(probe, cand):
+                    try:
+                        self.samples = int(getattr(probe, cand))
+                        break
+                    except Exception:
+                        pass
+            if self.samples is None:
+                self.samples = 3  # safe default
+                self.gcode.respond_info('[AUTO_TAP] Using default sample count = 3 (probe attribute not found)')
         if self.lift_speed is None:
-            self.lift_speed = probe.lift_speed
+            # Try to obtain lift_speed; fall back to probe speed or a conservative default.
+            lift_attr_candidates = [
+                'lift_speed',  # legacy / common
+                'speed',       # general probe movement speed
+            ]
+            for cand in lift_attr_candidates:
+                if hasattr(probe, cand):
+                    try:
+                        self.lift_speed = float(getattr(probe, cand))
+                        break
+                    except Exception:
+                        pass
+            if self.lift_speed is None:
+                self.lift_speed = 5.0
+                self.gcode.respond_info('[AUTO_TAP] Using default lift speed = 5.0 (probe attribute not found)')
 
     def handle_home_rails_end(self, homing_state, rails):
         if not len(self.steppers.keys()) == 3:
