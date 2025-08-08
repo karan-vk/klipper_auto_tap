@@ -1,5 +1,6 @@
 # Auto TAP for Voron TAP
 from mcu import MCU_endstop
+import time
 
 class TapVersion:
     Name = "None"
@@ -95,13 +96,14 @@ class AutoTAP:
         self.custom_multiple = config.getfloat( 'custom_multiple', default=10.0, minval=0.0)
         self.custom_adder = config.getfloat( 'custom_adder', default=1.0, minval=0.0)
 
-        if self.tap_version.Name == 'CUSTOM':
-            self.tap_version.Min = self.custom_min
-            self.tap_version.Max = self.custom_max
-            self.tap_version.Multiple = self.custom_multiple
-            self.tap_version.Adder = self.custom_adder
-            
+        # Custom values are stored on the AutoTAP instance and applied to the
+        # tap_version instance at runtime (avoids mutating class-level attributes).
+        
         self.offset = None
+        self.toolhead = None
+        # conservative speed limits (mm/s)
+        self.max_z_speed = 20.0
+        self.max_xy_speed = 500.0
 
         self.gcode_move = self.printer.load_object(config, 'gcode_move')
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
@@ -114,6 +116,8 @@ class AutoTAP:
         self.steppers = {}
 
     def handle_connect(self):
+        # Cache commonly used objects
+        self.toolhead = self.printer.lookup_object('toolhead')
         for endstop, name in self.printer.load_object(self.config, 'query_endstops').endstops:
             if name == 'z':
                 self.z_endstop = EndstopWrapper(self.config, endstop)
@@ -258,6 +262,13 @@ class AutoTAP:
 
         tap_version: TapVersion = tap_version()
 
+        # If using CUSTOM, apply instance overrides instead of mutating class attributes
+        if tap_version.Name == 'CUSTOM':
+            tap_version.Min = self.custom_min
+            tap_version.Max = self.custom_max
+            tap_version.Multiple = self.custom_multiple
+            tap_version.Adder = self.custom_adder
+
         if force == 0 and self.offset is not None:
             self.gcode.respond_info(f"Auto TAP set z-offset on {tap_version.Name} tap to {self.offset:.3f}")
             self._set_z_offset(self.offset)
@@ -305,7 +316,13 @@ class AutoTAP:
             result = tap_func(step, stop, probe_to, probe_speed)
             self._move([None, None, stop + retract], lift_speed)
             if result is None:
-                raise gcmd.error(f"Failed to de-actuate z_endstop after full travel! Try changing STOP to a value larger than {stop}")
+                # Retry once with a larger STOP before failing to be more tolerant of unexpected probe behaviour
+                retry_stop = stop * 1.5
+                self.gcode.respond_info(f"[AUTO_TAP] Initial attempt failed to detect release; retrying with STOP={retry_stop}")
+                result = tap_func(step, retry_stop, probe_to, probe_speed)
+                self._move([None, None, retry_stop + retract], lift_speed)
+                if result is None:
+                    raise gcmd.error(f"Failed to de-actuate z_endstop after full travel! Try changing STOP to a larger value than {stop} or check probe/endstop wiring")
             steps.append(result[0])
             probes.append(result[1]  - self.config_z_offset)
             measures.append(result[2])
@@ -322,9 +339,8 @@ class AutoTAP:
             probe_max = max(probes)
 
             measure_mean = self._calc_mean(measures)
-            measure_min = self._calc_mean(measures)
-            measure_max = self._calc_mean(measures)
-
+            measure_min = min(measures)
+            measure_max = max(measures)
 
             travel_mean = self._calc_mean(travels)
             travel_min = min(travels)
@@ -354,7 +370,8 @@ class AutoTAP:
             z_pos = probe + (step * step_size) # checking z-position
             self._move([None, None, z_pos], probe_speed)
             self.printer.lookup_object('toolhead').wait_moves() # Wait for toolhead to move
-            if not self._endstop_triggered():
+            # Use a debounced check to reduce false positives from bounce/jitter
+            if not self._endstop_released_debounced():
                 travel = abs(probe - z_pos)
                 return(step, probe, z_pos, travel)
         return None
@@ -367,13 +384,34 @@ class AutoTAP:
             z_pos = probe + (step * step_size) # checking z-position
             self._move([None, None, z_pos], probe_speed)
             self.printer.lookup_object('toolhead').wait_moves() # Wait for toolhead to move
-            if not self._endstop_triggered():
+            # Use debounced check to reduce false readings
+            if not self._endstop_released_debounced():
                 travel = abs(probe - z_pos)
                 return(step, probe, z_pos, travel)
         return None
 
     def _move(self, coord, speed):
-        self.printer.lookup_object('toolhead').manual_move(coord, speed)
+        # Clamp coordinates using homed steppers ranges if available and clamp speeds
+        if coord is None:
+            coord = [None, None, None]
+        x, y, z = coord[0], coord[1], coord[2]
+        if 'x' in self.steppers and x is not None:
+            lo, hi, _ = self.steppers['x']
+            x = max(lo, min(hi, x))
+        if 'y' in self.steppers and y is not None:
+            lo, hi, _ = self.steppers['y']
+            y = max(lo, min(hi, y))
+        if 'z' in self.steppers and z is not None:
+            lo, hi, _ = self.steppers['z']
+            z = max(lo, min(hi, z))
+        # Clamp speed conservatively
+        if speed is not None:
+            if z is not None:
+                speed = min(speed, self.max_z_speed)
+            else:
+                speed = min(speed, self.max_xy_speed)
+        toolhead = self.toolhead if self.toolhead is not None else self.printer.lookup_object('toolhead')
+        toolhead.manual_move([x, y, z], speed)
 
     def _probe(self, mcu_endstop, min_z: float, speed: float): # -> list[float, float, float]
         toolhead = self.printer.lookup_object('toolhead')
@@ -400,7 +438,17 @@ class AutoTAP:
             return False
         return True
 
+    def _endstop_released_debounced(self, checks=3, delay=0.02):
+        """Return True if endstop reads released (not triggered) consistently across checks."""
+        for _ in range(checks):
+            if self._endstop_triggered():
+                return False
+            time.sleep(delay)
+        return True
+
     def _calc_mean(self, positions):
+        if not positions:
+            return 0.0
         count = float(len(positions))
         return sum(positions) / count
 
