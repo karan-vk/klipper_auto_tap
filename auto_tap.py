@@ -1,8 +1,4 @@
-# Automate calibrating Voron TAP probe offset
-#
-# Copyright (C) 2023 Anonoei <dev@anonoei.com>
-#
-# This file may be distributed under the terms of the MIT license.
+# Auto TAP for Voron TAP
 from mcu import MCU_endstop
 
 class TapVersion:
@@ -126,8 +122,26 @@ class AutoTAP:
         if probe is None:
             raise self.printer.config_error("A probe is needed for %s"
                                             % (self.config.get_name()))
-                                            
-        self.config_z_offset = probe.z_offset
+        # Obtain the configured probe z-offset in a backwards / forwards compatible way.
+        # Older Klipper builds exposed 'z_offset'. Newer builds may provide a getter
+        # or use 'position_endstop' internally. Fall back to 0.0 if not found.
+        self.config_z_offset = 0.0
+        try:
+            if hasattr(probe, 'get_z_offset') and callable(getattr(probe, 'get_z_offset')):
+                self.config_z_offset = probe.get_z_offset()
+            elif hasattr(probe, 'z_offset'):
+                self.config_z_offset = getattr(probe, 'z_offset')
+            elif hasattr(probe, 'position_endstop'):
+                # Some probe wrappers expose position_endstop
+                self.config_z_offset = getattr(probe, 'position_endstop')
+            elif hasattr(probe, 'offset'):
+                # Fallback generic name
+                self.config_z_offset = getattr(probe, 'offset')
+            else:
+                self.gcode.respond_info("[AUTO_TAP] Could not automatically determine probe z_offset; defaulting to 0.0")
+        except Exception as e:
+            # Never allow an AttributeError here to halt startup; log and continue.
+            self.gcode.respond_info(f"[AUTO_TAP] Failed reading probe z_offset ({e}); defaulting to 0.0")
         
         if self.samples is None:
             self.samples = probe.sample_count
