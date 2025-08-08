@@ -117,11 +117,32 @@ class AutoTAP:
         for endstop, name in self.printer.load_object(self.config, 'query_endstops').endstops:
             if name == 'z':
                 self.z_endstop = EndstopWrapper(self.config, endstop)
+            # Be tolerant of naming variations such as 'probe:z' or 'z_virtual_endstop'
+            elif self.z_endstop is None and ('z' in name.lower() and (name.lower().endswith(':z') or 'virtual' in name.lower())):
+                try:
+                    self.z_endstop = EndstopWrapper(self.config, endstop)
+                except Exception:
+                    pass
 
         probe = self.printer.lookup_object('probe', default=None)
         if probe is None:
             raise self.printer.config_error("A probe is needed for %s"
                                             % (self.config.get_name()))
+        # If we have not yet identified a Z endstop, try to derive it from the probe implementation.
+        if self.z_endstop is None:
+            probe_endstop_candidate = None
+            for cand in ('mcu_probe', 'mcu_endstop', 'probe_endstop'):
+                if hasattr(probe, cand):
+                    probe_endstop_candidate = getattr(probe, cand)
+                    break
+            if probe_endstop_candidate is not None:
+                try:
+                    self.z_endstop = EndstopWrapper(self.config, probe_endstop_candidate)
+                    self.gcode.respond_info('[AUTO_TAP] Using probe internal endstop as Z reference')
+                except Exception:
+                    pass
+        if self.z_endstop is None:
+            self.gcode.respond_info('[AUTO_TAP] WARNING: Could not determine Z endstop (TAP) automatically. AUTO_TAP will fail until this is resolved.')
         # Obtain the configured probe z-offset in a backwards / forwards compatible way.
         # Older Klipper builds exposed 'z_offset'. Newer builds may provide a getter
         # or use 'position_endstop' internally. Fall back to 0.0 if not found.
@@ -205,6 +226,8 @@ class AutoTAP:
         self.printer.lookup_object('toolhead').wait_moves()
         if len(self.steppers.keys()) < 3:
             raise gcmd.error(f"Must home axes first. Found {len(self.steppers.keys())} homed axes.")
+        if self.z_endstop is None:
+            raise gcmd.error("Z endstop (TAP/probe) not detected. Ensure the printer is homed and TAP/probe is configured. If using a non-standard probe name, please report this so support can be added.")
         
         tap_version = gcmd.get('TAP_VERSION', default=self.tap_version)
 
